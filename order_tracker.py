@@ -5,6 +5,7 @@ import os
 import pickle
 import base64
 from datetime import datetime
+import sys
 
 CONFIG = {
     'opticalh': {
@@ -19,10 +20,15 @@ CONFIG = {
     }
 }
 
+def log(msg):
+    print(f"[ORDER_TRACKER] {msg}", flush=True)
+    sys.stdout.flush()
+
 class OrderTracker:
     def __init__(self):
         self.last_ids = self.load_last_ids()
         self.scraper = cloudscraper.create_scraper()
+        log(f"Inicializado. IDs: {self.last_ids}")
     
     def load_last_ids(self):
         if os.path.exists('last_order_ids.pkl'):
@@ -33,6 +39,7 @@ class OrderTracker:
     def save_last_ids(self):
         with open('last_order_ids.pkl', 'wb') as f:
             pickle.dump(self.last_ids, f)
+        log(f"IDs guardados: {self.last_ids}")
 
     def get_country_name(self, store, address_id):
         try:
@@ -59,7 +66,8 @@ class OrderTracker:
                         return item.get('value')
                 return name_data[0].get('value') if name_data else "Internacional"
             return name_data if isinstance(name_data, str) else "Internacional"
-        except:
+        except Exception as e:
+            log(f"Error obteniendo país: {e}")
             return "Error"
     
     def get_orders(self, store, limit=20):
@@ -70,20 +78,26 @@ class OrderTracker:
         headers = {'Authorization': f'Basic {auth}'}
         params = {'output_format': 'JSON', 'display': 'full', 'sort': '[id_DESC]', 'limit': limit}
         
+        log(f"Consultando {store}...")
         try:
             response = self.scraper.get(api_url, headers=headers, params=params, timeout=30)
+            log(f"{store} respuesta: {response.status_code}")
             data = response.json()
             if 'orders' in data:
-                return data['orders'] if isinstance(data['orders'], list) else [data['orders']]
-        except:
-            pass
+                orders = data['orders'] if isinstance(data['orders'], list) else [data['orders']]
+                log(f"{store}: {len(orders)} pedidos obtenidos")
+                return orders
+        except Exception as e:
+            log(f"ERROR en {store}: {str(e)}")
         return []
     
     def check_new_orders(self):
+        log("Iniciando verificación...")
         new_orders = []
         for store in ['opticalh', 'gafascanarias']:
             orders = self.get_orders(store)
             last_id = self.last_ids.get(store, 0)
+            log(f"{store} - Último ID conocido: {last_id}")
             
             for order in orders:
                 order_id = int(order.get('id', 0))
@@ -103,17 +117,26 @@ class OrderTracker:
                         'country': country,
                         'date': order.get('date_add', '')
                     })
+                    log(f"NUEVO: {config['prefix']}{order_id} - {total_eur}€ - {country}")
             
             if orders:
                 latest = max(int(o.get('id', 0)) for o in orders)
                 if latest > last_id:
                     self.last_ids[store] = latest
                     self.save_last_ids()
+        
+        log(f"Total pedidos nuevos: {len(new_orders)}")
         return new_orders
 
 if __name__ == '__main__':
+    log("=== INICIANDO ORDER TRACKER ===")
     tracker = OrderTracker()
     orders = tracker.check_new_orders()
     if orders:
+        log(f"Guardando {len(orders)} pedidos en JSON...")
         with open('new_orders.json', 'w') as f:
             json.dump(orders, f, indent=2)
+        log("JSON guardado correctamente")
+    else:
+        log("No hay pedidos nuevos")
+    log("=== FINALIZANDO ===")
