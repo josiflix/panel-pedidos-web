@@ -1,12 +1,16 @@
-#!/usr/bin/env python3
-import cloudscraper
-import json
 import os
+import json
 import pickle
 import base64
+import cloudscraper
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+from flask import Flask, render_template_string, jsonify
 from datetime import datetime
-import sys
 
+app = Flask(__name__)
+
+# --- CONFIGURACIÓN ---
 CONFIG = {
     'opticalh': {
         'api_key': 'JQ2WS8YAC8GIPJHHW3WYRFD47QKCWLSY',
@@ -20,123 +24,219 @@ CONFIG = {
     }
 }
 
-def log(msg):
-    print(f"[ORDER_TRACKER] {msg}", flush=True)
-    sys.stdout.flush()
+# --- HTML DEL PANEL ---
+HTML = """
+<!DOCTYPE html>
+<html lang='es'>
+<head>
+    <meta charset='UTF-8'>
+    <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+    <title>Panel Pedidos Cloud</title>
+    <style>
+        body{font-family:-apple-system,system-ui,sans-serif;background:#f3f4f6;padding:20px;max-width:600px;margin:0 auto}
+        .card{background:white;padding:24px;border-radius:16px;box-shadow:0 4px 6px rgba(0,0,0,0.1);text-align:center}
+        h1{color:#111827;font-size:24px;margin-bottom:8px}
+        .btn{background:#2563EB;color:white;border:none;padding:16px;width:100%;border-radius:12px;font-size:18px;font-weight:600;cursor:pointer;margin:20px 0}
+        .btn:disabled{opacity:0.5;cursor:wait}
+        .logs{background:#1f2937;color:#10b981;padding:16px;border-radius:12px;font-family:monospace;font-size:12px;text-align:left;height:200px;overflow-y:auto;margin-top:20px}
+        .stat-box{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:20px}
+        .stat{background:#f9fafb;padding:10px;border-radius:8px;border:1px solid #e5e7eb}
+        .val{font-weight:bold;font-size:18px;color:#2563EB}
+    </style>
+</head>
+<body>
+    <div class='card'>
+        <h1>☁️ Panel Cloud</h1>
+        <p style="color:#6b7280">Sistema integrado OpticalH & GC</p>
+        
+        <div class="stat-box">
+            <div class="stat">OPT: <span class="val" id="opt">--</span></div>
+            <div class="stat">GC: <span class="val" id="gc">--</span></div>
+        </div>
 
-class OrderTracker:
+        <button class='btn' id="btn" onclick='run()'>🔄 Verificar y Volcar</button>
+        
+        <div class='logs' id="logs">Esperando ejecución...</div>
+    </div>
+    <script>
+        async function run(){
+            const btn = document.getElementById('btn');
+            const logs = document.getElementById('logs');
+            btn.disabled = true;
+            btn.innerText = "⏳ Procesando...";
+            logs.innerHTML = "🚀 Iniciando proceso en la nube...\n";
+            
+            try {
+                const res = await fetch('/api/run', {method:'POST'});
+                const data = await res.json();
+                
+                data.logs.forEach(line => {
+                    logs.innerHTML += line + "<br>";
+                });
+                
+                logs.scrollTop = logs.scrollHeight;
+                document.getElementById('opt').innerText = data.stats.opticalh;
+                document.getElementById('gc').innerText = data.stats.gafascanarias;
+                
+                if(data.success){
+                    btn.innerText = "✅ Completado";
+                } else {
+                    btn.innerText = "❌ Error";
+                }
+            } catch(e) {
+                logs.innerHTML += "❌ Error de conexión: " + e;
+            }
+            
+            setTimeout(() => { btn.disabled = false; btn.innerText = "🔄 Verificar y Volcar"; }, 3000);
+        }
+        
+        // Cargar stats al inicio
+        fetch('/api/stats').then(r=>r.json()).then(d=>{
+            document.getElementById('opt').innerText = d.opticalh;
+            document.getElementById('gc').innerText = d.gafascanarias;
+        });
+    </script>
+</body>
+</html>
+"""
+
+# --- GESTOR DE ESTADO (MEMORIA) ---
+# En Render, usaremos /tmp/ para archivos temporales, aunque se borran al reiniciar.
+STATE_FILE = '/tmp/last_ids.pkl'
+
+def load_state():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, 'rb') as f:
+            return pickle.load(f)
+    # VALORES POR DEFECTO SI SE REINICIA EL SERVIDOR
+    return {'opticalh': 38227, 'gafascanarias': 100}
+
+def save_state(data):
+    with open(STATE_FILE, 'wb') as f:
+        pickle.dump(data, f)
+
+# --- CLASE PRINCIPAL ---
+class CloudSystem:
     def __init__(self):
-        self.last_ids = self.load_last_ids()
+        self.logs = []
         self.scraper = cloudscraper.create_scraper()
-        log(f"Inicializado. IDs: {self.last_ids}")
-    
-    def load_last_ids(self):
-        if os.path.exists('last_order_ids.pkl'):
-            with open('last_order_ids.pkl', 'rb') as f:
-                return pickle.load(f)
-        return {'opticalh': 0, 'gafascanarias': 0}
-    
-    def save_last_ids(self):
-        with open('last_order_ids.pkl', 'wb') as f:
-            pickle.dump(self.last_ids, f)
-        log(f"IDs guardados: {self.last_ids}")
+        self.last_ids = load_state()
+        self.sheet = None
 
-    def get_country_name(self, store, address_id):
+    def log(self, msg):
+        print(msg) # Para ver en la consola de Render
+        self.logs.append(msg)
+
+    def connect_google(self):
         try:
-            config = CONFIG[store]
-            auth = base64.b64encode(f"{config['api_key']}:".encode()).decode()
+            # EN RENDER: Leemos la variable de entorno GOOGLE_JSON
+            json_creds = os.environ.get('GOOGLE_JSON')
+            
+            if not json_creds:
+                # Fallback para local si existe el archivo
+                if os.path.exists('google_credentials.json'):
+                    with open('google_credentials.json') as f:
+                        creds_dict = json.load(f)
+                else:
+                    self.log("❌ ERROR: No se encuentra GOOGLE_JSON en variables de entorno")
+                    return False
+            else:
+                creds_dict = json.loads(json_creds)
+
+            scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+            client = gspread.authorize(creds)
+            self.sheet = client.open_by_key('1BlQQjahxpJO208gR5Z3PSX9YErwXRauxdfbAQuI8QUw').sheet1
+            self.log("✅ Conectado a Google Sheets")
+            return True
+        except Exception as e:
+            self.log(f"❌ Error Google Auth: {str(e)}")
+            return False
+
+    def get_country(self, store, address_id):
+        try:
+            cfg = CONFIG[store]
+            auth = base64.b64encode(f"{cfg['api_key']}:".encode()).decode()
             headers = {'Authorization': f'Basic {auth}'}
             
-            r_addr = self.scraper.get(f"{config['url']}/api/addresses/{address_id}?output_format=JSON", headers=headers, timeout=10)
-            if r_addr.status_code != 200:
-                return "Desconocido"
+            # Dirección
+            r = self.scraper.get(f"{cfg['url']}/api/addresses/{address_id}?output_format=JSON", headers=headers)
+            if r.status_code != 200: return "Desconocido"
+            country_id = r.json().get('address', {}).get('id_country')
             
-            id_country = r_addr.json().get('address', {}).get('id_country')
-            if not id_country:
-                return "Desconocido"
+            # País
+            r = self.scraper.get(f"{cfg['url']}/api/countries/{country_id}?output_format=JSON", headers=headers)
+            name = r.json().get('country', {}).get('name')
+            if isinstance(name, list): return name[0]['value']
+            return name
+        except:
+            return "Inter."
 
-            r_country = self.scraper.get(f"{config['url']}/api/countries/{id_country}?output_format=JSON", headers=headers, timeout=10)
-            if r_country.status_code != 200:
-                return "Desconocido"
-            
-            name_data = r_country.json().get('country', {}).get('name')
-            if isinstance(name_data, list):
-                for item in name_data:
-                    if item.get('id') == '1':
-                        return item.get('value')
-                return name_data[0].get('value') if name_data else "Internacional"
-            return name_data if isinstance(name_data, str) else "Internacional"
-        except Exception as e:
-            log(f"Error obteniendo país: {e}")
-            return "Error"
-    
-    def get_orders(self, store, limit=20):
-        config = CONFIG[store]
-        api_url = f"{config['url']}/api/orders"
-        credentials = f"{config['api_key']}:"
-        auth = base64.b64encode(credentials.encode()).decode()
-        headers = {'Authorization': f'Basic {auth}'}
-        params = {'output_format': 'JSON', 'display': 'full', 'sort': '[id_DESC]', 'limit': limit}
+    def process(self):
+        if not self.connect_google(): return False
         
-        log(f"Consultando {store}...")
-        try:
-            response = self.scraper.get(api_url, headers=headers, params=params, timeout=30)
-            log(f"{store} respuesta: {response.status_code}")
-            data = response.json()
-            if 'orders' in data:
-                orders = data['orders'] if isinstance(data['orders'], list) else [data['orders']]
-                log(f"{store}: {len(orders)} pedidos obtenidos")
-                return orders
-        except Exception as e:
-            log(f"ERROR en {store}: {str(e)}")
-        return []
-    
-    def check_new_orders(self):
-        log("Iniciando verificación...")
-        new_orders = []
+        count = 0
         for store in ['opticalh', 'gafascanarias']:
-            orders = self.get_orders(store)
-            last_id = self.last_ids.get(store, 0)
-            log(f"{store} - Último ID conocido: {last_id}")
+            self.log(f"🔍 Verificando {store}...")
+            cfg = CONFIG[store]
+            auth = base64.b64encode(f"{cfg['api_key']}:".encode()).decode()
+            headers = {'Authorization': f'Basic {auth}'}
             
-            for order in orders:
-                order_id = int(order.get('id', 0))
-                if order_id > last_id:
-                    config = CONFIG[store]
-                    
-                    total_original = float(order.get('total_paid_real', 0))
-                    conversion_rate = float(order.get('conversion_rate', 1))
-                    total_eur = round(total_original / conversion_rate, 2) if conversion_rate > 0 else total_original
-                    
-                    country = self.get_country_name(store, order.get('id_address_delivery'))
-                    
-                    new_orders.append({
-                        'id': f"{config['prefix']}{order_id}",
-                        'store': store,
-                        'total': total_eur,
-                        'country': country,
-                        'date': order.get('date_add', '')
-                    })
-                    log(f"NUEVO: {config['prefix']}{order_id} - {total_eur}€ - {country}")
-            
-            if orders:
-                latest = max(int(o.get('id', 0)) for o in orders)
-                if latest > last_id:
-                    self.last_ids[store] = latest
-                    self.save_last_ids()
+            try:
+                url = f"{cfg['url']}/api/orders?output_format=JSON&display=full&sort=[id_DESC]&limit=10"
+                r = self.scraper.get(url, headers=headers)
+                
+                if r.status_code != 200:
+                    self.log(f"⚠️ Error HTTP {r.status_code} en {store}")
+                    continue
+
+                orders = r.json().get('orders', [])
+                if isinstance(orders, dict): orders = [orders]
+                
+                # Ordenar antiguos a nuevos
+                orders.sort(key=lambda x: int(x['id']))
+                
+                last_id = self.last_ids.get(store, 0)
+                
+                for o in orders:
+                    oid = int(o['id'])
+                    if oid > last_id:
+                        # Procesar pedido
+                        total = float(o['total_paid_real'])
+                        rate = float(o.get('conversion_rate', 1))
+                        total_eur = round(total / rate, 2) if rate > 0 else total
+                        country = self.get_country(store, o['id_address_delivery'])
+                        formatted_id = f"{cfg['prefix']}{oid}"
+                        
+                        # SUBIR A SHEETS DIRECTAMENTE
+                        self.sheet.append_row([formatted_id, country, total_eur])
+                        self.log(f"✅ Volcado: {formatted_id} ({country}) {total_eur}€")
+                        
+                        self.last_ids[store] = oid
+                        count += 1
+                        
+            except Exception as e:
+                self.log(f"❌ Error procesando {store}: {e}")
         
-        log(f"Total pedidos nuevos: {len(new_orders)}")
-        return new_orders
+        save_state(self.last_ids)
+        if count == 0: self.log("ℹ️ No hay pedidos nuevos")
+        else: self.log(f"🎉 Procesados {count} pedidos")
+        return True
+
+# --- FLASK ---
+@app.route('/')
+def index(): return render_template_string(HTML)
+
+@app.route('/api/run', methods=['POST'])
+def run_api():
+    sys = CloudSystem()
+    success = sys.process()
+    return jsonify({'logs': sys.logs, 'stats': sys.last_ids, 'success': success})
+
+@app.route('/api/stats')
+def stats_api():
+    return jsonify(load_state())
 
 if __name__ == '__main__':
-    log("=== INICIANDO ORDER TRACKER ===")
-    tracker = OrderTracker()
-    orders = tracker.check_new_orders()
-    if orders:
-        log(f"Guardando {len(orders)} pedidos en JSON...")
-        with open('new_orders.json', 'w') as f:
-            json.dump(orders, f, indent=2)
-        log("JSON guardado correctamente")
-    else:
-        log("No hay pedidos nuevos")
-    log("=== FINALIZANDO ===")
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
