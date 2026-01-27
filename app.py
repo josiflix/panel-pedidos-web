@@ -65,7 +65,7 @@ HTML = """
             const logs = document.getElementById('logs');
             btn.disabled = true;
             btn.innerText = "⏳ Procesando...";
-            logs.innerHTML = "🚀 Iniciando proceso en la nube...<br>";
+            logs.innerHTML = "🚀 Iniciando proceso...<br>";
             
             try {
                 const res = await fetch('/api/run', {method:'POST'});
