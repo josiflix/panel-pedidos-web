@@ -1,8 +1,3 @@
-notepad requirements.txt
-```
-
-Debe tener **SOLO** estas 3 líneas (nada más):
-```
 flask==3.0.0
 gunicorn==21.2.0
 cloudscraper==1.2.71
