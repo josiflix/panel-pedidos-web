@@ -1,9 +1,8 @@
-notepad .gitignore
+notepad requirements.txt
 ```
 
-**Copia y pega**:
+Debe tener **SOLO** estas 3 líneas (nada más):
 ```
-*.pkl
-*.log
-*.json
-__pycache__/
+flask==3.0.0
+gunicorn==21.2.0
+cloudscraper==1.2.71
