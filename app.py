@@ -1,16 +1,16 @@
 import os
 import json
-import pickle
 import base64
 import cloudscraper
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from flask import Flask, render_template_string, jsonify
-from datetime import datetime
+import sys
+import pickle
 
 app = Flask(__name__)
 
-# --- CONFIGURACIÓN ---
+# --- CONFIGURACIÓN TIENDAS ---
 CONFIG = {
     'opticalh': {
         'api_key': 'JQ2WS8YAC8GIPJHHW3WYRFD47QKCWLSY',
@@ -42,6 +42,7 @@ HTML = """
         .stat-box{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:20px}
         .stat{background:#f9fafb;padding:10px;border-radius:8px;border:1px solid #e5e7eb}
         .val{font-weight:bold;font-size:18px;color:#2563EB}
+        .error{color:#EF4444}
     </style>
 </head>
 <body>
@@ -64,7 +65,7 @@ HTML = """
             const logs = document.getElementById('logs');
             btn.disabled = true;
             btn.innerText = "⏳ Procesando...";
-            logs.innerHTML = "🚀 Iniciando proceso en la nube...\n";
+            logs.innerHTML = "🚀 Iniciando proceso en la nube...<br>";
             
             try {
                 const res = await fetch('/api/run', {method:'POST'});
@@ -84,7 +85,7 @@ HTML = """
                     btn.innerText = "❌ Error";
                 }
             } catch(e) {
-                logs.innerHTML += "❌ Error de conexión: " + e;
+                logs.innerHTML += "<span class='error'>❌ Error de conexión: " + e + "</span>";
             }
             
             setTimeout(() => { btn.disabled = false; btn.innerText = "🔄 Verificar y Volcar"; }, 3000);
@@ -101,14 +102,12 @@ HTML = """
 """
 
 # --- GESTOR DE ESTADO (MEMORIA) ---
-# En Render, usaremos /tmp/ para archivos temporales, aunque se borran al reiniciar.
 STATE_FILE = '/tmp/last_ids.pkl'
 
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, 'rb') as f:
             return pickle.load(f)
-    # VALORES POR DEFECTO SI SE REINICIA EL SERVIDOR
     return {'opticalh': 38227, 'gafascanarias': 100}
 
 def save_state(data):
@@ -122,35 +121,42 @@ class CloudSystem:
         self.scraper = cloudscraper.create_scraper()
         self.last_ids = load_state()
         self.sheet = None
+        self.existing_ids = []
 
     def log(self, msg):
-        print(msg) # Para ver en la consola de Render
+        print(msg) 
         self.logs.append(msg)
 
     def connect_google(self):
         try:
-            # EN RENDER: Leemos la variable de entorno GOOGLE_JSON
+            # 1. Obtener credenciales (Variable de entorno o archivo local)
             json_creds = os.environ.get('GOOGLE_JSON')
             
             if not json_creds:
-                # Fallback para local si existe el archivo
                 if os.path.exists('google_credentials.json'):
                     with open('google_credentials.json') as f:
                         creds_dict = json.load(f)
+                        self.log("💻 Modo Local detectado")
                 else:
-                    self.log("❌ ERROR: No se encuentra GOOGLE_JSON en variables de entorno")
+                    self.log("<span class='error'>❌ ERROR: No se encuentra GOOGLE_JSON</span>")
                     return False
             else:
                 creds_dict = json.loads(json_creds)
+                self.log("☁️ Modo Nube detectado")
 
             scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
             creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
             client = gspread.authorize(creds)
             self.sheet = client.open_by_key('1BlQQjahxpJO208gR5Z3PSX9YErwXRauxdfbAQuI8QUw').sheet1
-            self.log("✅ Conectado a Google Sheets")
+            
+            # --- CORRECCIÓN: LEER DATOS EXISTENTES PARA EVITAR DUPLICADOS Y HUECOS ---
+            # Leemos toda la columna A. Filtramos celdas vacías.
+            self.existing_ids = list(filter(None, self.sheet.col_values(1)))
+            
+            self.log(f"✅ Conectado a Google Sheets ({len(self.existing_ids)} pedidos existentes)")
             return True
         except Exception as e:
-            self.log(f"❌ Error Google Auth: {str(e)}")
+            self.log(f"<span class='error'>❌ Error Google Auth: {str(e)}</span>")
             return False
 
     def get_country(self, store, address_id):
@@ -159,12 +165,10 @@ class CloudSystem:
             auth = base64.b64encode(f"{cfg['api_key']}:".encode()).decode()
             headers = {'Authorization': f'Basic {auth}'}
             
-            # Dirección
             r = self.scraper.get(f"{cfg['url']}/api/addresses/{address_id}?output_format=JSON", headers=headers)
             if r.status_code != 200: return "Desconocido"
             country_id = r.json().get('address', {}).get('id_country')
             
-            # País
             r = self.scraper.get(f"{cfg['url']}/api/countries/{country_id}?output_format=JSON", headers=headers)
             name = r.json().get('country', {}).get('name')
             if isinstance(name, list): return name[0]['value']
@@ -179,12 +183,12 @@ class CloudSystem:
         for store in ['opticalh', 'gafascanarias']:
             self.log(f"🔍 Verificando {store}...")
             cfg = CONFIG[store]
-            auth = base64.b64encode(f"{cfg['api_key']}:".encode()).decode()
-            headers = {'Authorization': f'Basic {auth}'}
+            
+            # Usamos ws_key en URL para evitar bloqueos
+            url = f"{cfg['url']}/api/orders?ws_key={cfg['api_key']}&output_format=JSON&display=full&sort=[id_DESC]&limit=10"
             
             try:
-                url = f"{cfg['url']}/api/orders?output_format=JSON&display=full&sort=[id_DESC]&limit=10"
-                r = self.scraper.get(url, headers=headers)
+                r = self.scraper.get(url)
                 
                 if r.status_code != 200:
                     self.log(f"⚠️ Error HTTP {r.status_code} en {store}")
@@ -196,31 +200,46 @@ class CloudSystem:
                 # Ordenar antiguos a nuevos
                 orders.sort(key=lambda x: int(x['id']))
                 
-                last_id = self.last_ids.get(store, 0)
-                
                 for o in orders:
                     oid = int(o['id'])
-                    if oid > last_id:
-                        # Procesar pedido
-                        total = float(o['total_paid_real'])
-                        rate = float(o.get('conversion_rate', 1))
-                        total_eur = round(total / rate, 2) if rate > 0 else total
-                        country = self.get_country(store, o['id_address_delivery'])
-                        formatted_id = f"{cfg['prefix']}{oid}"
-                        
-                        # SUBIR A SHEETS DIRECTAMENTE
-                        self.sheet.append_row([formatted_id, country, total_eur])
-                        self.log(f"✅ Volcado: {formatted_id} ({country}) {total_eur}€")
-                        
+                    formatted_id = f"{cfg['prefix']}{oid}"
+                    
+                    # 1. VERIFICAR SI YA EXISTE EN EL EXCEL (Para no duplicar)
+                    if formatted_id in self.existing_ids:
+                        # Si ya existe, actualizamos nuestra memoria local y saltamos
+                        if oid > self.last_ids.get(store, 0):
+                            self.last_ids[store] = oid
+                        continue
+                    
+                    # 2. PROCESAR PEDIDO NUEVO
+                    total = float(o['total_paid_real'])
+                    rate = float(o.get('conversion_rate', 1))
+                    total_eur = round(total / rate, 2) if rate > 0 else total
+                    country = self.get_country(store, o['id_address_delivery'])
+                    
+                    # 3. INSERCIÓN INTELIGENTE (Sin huecos)
+                    # Calculamos la siguiente fila disponible basándonos en los datos reales
+                    next_row = len(self.existing_ids) + 1
+                    
+                    # Escribimos usando rangos específicos (Más seguro que append_row)
+                    # Rango: A{fila}:C{fila} -> [ID, PAIS, PRECIO]
+                    self.sheet.update(range_name=f"A{next_row}:C{next_row}", values=[[formatted_id, country, total_eur]])
+                    
+                    # Añadimos a la lista temporal para que el siguiente pedido sepa dónde ir
+                    self.existing_ids.append(formatted_id)
+                    
+                    self.log(f"✅ <b>Volcado:</b> {formatted_id} ({country}) {total_eur}€")
+                    
+                    if oid > self.last_ids.get(store, 0):
                         self.last_ids[store] = oid
-                        count += 1
+                    count += 1
                         
             except Exception as e:
-                self.log(f"❌ Error procesando {store}: {e}")
+                self.log(f"<span class='error'>❌ Error procesando {store}: {e}</span>")
         
         save_state(self.last_ids)
-        if count == 0: self.log("ℹ️ No hay pedidos nuevos")
-        else: self.log(f"🎉 Procesados {count} pedidos")
+        if count == 0: self.log("ℹ️ No hay pedidos nuevos para volcar")
+        else: self.log(f"🎉 Procesados {count} pedidos correctamente")
         return True
 
 # --- FLASK ---
