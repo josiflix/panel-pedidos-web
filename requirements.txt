@@ -1,0 +1,9 @@
+notepad .gitignore
+```
+
+**Copia y pega**:
+```
+*.pkl
+*.log
+*.json
+__pycache__/
